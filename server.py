@@ -120,21 +120,180 @@ class Bot:
             self.save()
 
 
+class StockBot(Bot):
+    """Paper account state is authoritative; local files hold only strategy/journal state."""
+    def __init__(self, persist=True, client=None):
+        from alpaca import Alpaca
+        super().__init__(persist=False)
+        self.persist = persist
+        self.client = client or Alpaca()
+        self.symbol = os.getenv('ALPACA_SYMBOL', 'SPY').upper()
+        import re
+        if not re.fullmatch(r'[A-Z][A-Z0-9.]{0,9}', self.symbol):
+            raise ValueError('ALPACA_SYMBOL must be a US stock ticker such as SPY or AAPL.')
+        self.running = False
+        self.cash = self.equity = self.qty = self.cost = self.pnl = 0.0
+        self.pending = None
+        self.market_open = False
+        self.account_ready = False
+        self.position_value = 0.0
+        self.next_open = None
+        self.last_trade_time = 0.0
+        self.blocked = True
+        if persist and STOCK_DATA.exists():
+            saved = json.loads(STOCK_DATA.read_text())
+            if saved.get('symbol') == self.symbol:
+                self.short, self.long = saved.get('short', 5), saved.get('long', 20)
+                self.events.extend(saved.get('events', []))
+            # An unresolved submission is reconciled even if the selected ticker changes.
+            self.pending = saved.get('pending')
+        self.event('BOT', f'{self.symbol} · Alpaca paper mode. Start paused; resume after reviewing your account.')
+
+    def snapshot(self):
+        with self.lock:
+            return dict(cash=self.cash, equity=self.equity, qty=self.qty, cost=self.cost,
+                        position_value=self.position_value, pnl=self.pnl, realized=None,
+                        running=self.running, short=self.short, long=self.long, regime=self.regime,
+                        prices=list(self.prices), events=list(self.events), trades=list(self.trades),
+                        feed=self.feed, error=self.error, last_tick=self.last_tick,
+                        symbol=self.symbol, interval=10, fee_rate=None,
+                        market_open=self.market_open, next_open=self.next_open,
+                        account_ready=self.account_ready, pending=self.pending)
+
+    def save(self):
+        if self.persist:
+            STOCK_DATA.parent.mkdir(exist_ok=True)
+            temp = STOCK_DATA.with_suffix('.tmp')
+            temp.write_text(json.dumps(dict(symbol=self.symbol, short=self.short, long=self.long,
+                                           events=list(self.events), pending=self.pending)))
+            temp.replace(STOCK_DATA)
+
+    def reconcile(self):
+        if not self.pending:
+            return
+        from urllib.parse import quote
+        order = self.client.request('/v2/orders:by_client_order_id?client_order_id=' + quote(self.pending, safe=''))
+        if order is None:
+            raise ValueError('An earlier submission has uncertain status. Orders are blocked. Inspect the Alpaca paper account and follow README recovery instructions.')
+        terminal = {'filled', 'canceled', 'expired', 'rejected', 'replaced', 'done_for_day'}
+        if order['status'] in terminal:
+            self.event('ORDER', f"Order {order['client_order_id']} · {order['status']} · filled {order.get('filled_qty', '0')} shares")
+            self.pending = None
+            self.save()
+
+    def refresh(self):
+        from datetime import datetime
+        with self.lock:
+            self.reconcile()
+            account = self.client.request('/v2/account')
+            positions = self.client.request('/v2/positions')
+            orders = self.client.request('/v2/orders?status=all&limit=100&direction=desc')
+            clock = self.client.request('/v2/clock')
+            asset = self.client.request('/v2/assets/' + self.symbol)
+            if not account or positions is None or orders is None or not clock or not asset:
+                raise ValueError('Alpaca returned incomplete account or asset data.')
+            if not asset.get('tradable') or asset.get('class') != 'us_equity':
+                raise ValueError('Select a tradable US equity ticker in ALPACA_SYMBOL and restart.')
+            self.cash = float(account['cash'])
+            self.equity = float(account['equity'])
+            self.pnl = self.equity - float(account['last_equity'])
+            self.buying_power = float(account['buying_power'])
+            self.blocked = bool(account.get('trading_blocked') or account.get('account_blocked') or account.get('trade_suspended_by_user')) or account.get('status') != 'ACTIVE'
+            pos = next((p for p in positions if p['symbol'] == self.symbol), None)
+            self.qty = float(pos['qty']) if pos else 0.0
+            self.cost = float(pos['cost_basis']) if pos else 0.0
+            self.position_value = float(pos['market_value']) if pos else 0.0
+            # Check all open orders separately; recent history can omit older working orders.
+            open_orders = self.client.request('/v2/orders?status=open&limit=500')
+            if open_orders is None:
+                raise ValueError('Could not verify working orders.')
+            self.has_open_order = any(o['symbol'] == self.symbol for o in open_orders)
+            self.market_open = bool(clock['is_open'])
+            self.next_open = clock.get('next_open')
+            def order_time(o):
+                return datetime.fromisoformat(o['submitted_at'].replace('Z', '+00:00')).timestamp()
+            self.trades.clear()
+            for o in orders:
+                if o['symbol'] != self.symbol:
+                    continue
+                self.trades.append(dict(time=order_time(o), side=o['side'].upper(),
+                                        price=float(o['filled_avg_price']) if o.get('filled_avg_price') else None,
+                                        qty=float(o.get('filled_qty') or 0), fee=None,
+                                        status=o['status'], id=o['id'], client_order_id=o.get('client_order_id')))
+            self.account_ready = True
+            if self.blocked:
+                raise ValueError('Alpaca account is not active or trading is blocked. Review your paper account.')
+            if not self.market_open:
+                self.feed = 'Market closed'
+                self.error = None
+                self.regime = None
+                self.prices.clear()
+                self.save()
+                return
+            latest = self.client.latest(self.symbol)
+            trade = (latest or {}).get('trade')
+            if not trade:
+                raise ValueError('No IEX trade available for the selected stock.')
+            stamp = datetime.fromisoformat(trade['t'].replace('Z', '+00:00')).timestamp()
+            now = time.time()
+            price = float(trade['p'])
+            import math
+            if not math.isfinite(price) or price <= 0 or not -5 <= now - stamp <= 30:
+                raise ValueError('IEX trade is stale or invalid. Waiting for fresh market data; orders disabled.')
+            if stamp <= self.last_trade_time:
+                if now - self.last_tick > 30:
+                    raise ValueError('No fresh IEX trade. Orders disabled until the feed recovers.')
+                return
+            self.last_trade_time = stamp
+            self.tick(price, now)
+
+    def execute(self, side, price, now):
+        import uuid
+        if self.pending or self.has_open_order:
+            self.event('HOLD', 'An order is still working or being reconciled; no new order sent.')
+            return
+        if self.blocked or not self.market_open or self.qty < 0:
+            self.event('HOLD', 'Account, market, or existing short position prevents an order.')
+            return
+        if side == 'BUY' and self.qty == 0:
+            import math
+            quantity = math.floor(min(max(self.cash, 0) * 0.25, self.buying_power) / (price * 1.01))
+            if quantity < 1:
+                self.event('HOLD', 'Insufficient cash allocation for one whole share.')
+                return
+        elif side == 'SELL' and self.qty > 0:
+            quantity = self.qty
+        else:
+            self.event('HOLD', 'Position already open.' if side == 'BUY' else 'No shares to sell.')
+            return
+        self.pending = 'meridian-' + uuid.uuid4().hex
+        self.save()  # Durable intent BEFORE submission; never retry an uncertain POST.
+        self.event('ORDER', f'Submitting paper {side} · {quantity:g} {self.symbol} · {self.pending}')
+        order = self.client.request('/v2/orders', method='POST', body=dict(
+            symbol=self.symbol, qty=str(quantity), side=side.lower(), type='market',
+            time_in_force='day', client_order_id=self.pending))
+        if not order:
+            raise ValueError('Order submission uncertain; reconciliation required.')
+        self.event('ORDER', f"Alpaca paper order {order['id']} · {order['status']}")
+        self.save()
+
+
+STOCK_DATA = ROOT / 'data' / 'alpaca-state.json'
+
+
 def poll(bot):
     while True:
         try:
-            request = urllib.request.Request('https://api.coinbase.com/v2/prices/BTC-USD/spot', headers={'User-Agent': 'MovingAveragePaperBot/1.0', 'Cache-Control': 'no-cache'})
-            with urllib.request.urlopen(request, timeout=8) as response:
-                price = float(json.load(response)['data']['amount'])
-            if not 0 < price < float('inf'):
-                raise ValueError('Invalid market price')
-            bot.tick(price)
+            bot.refresh()
         except Exception as exc:
             with bot.lock:
-                if bot.feed != 'Unavailable':
-                    bot.event('FEED', 'Live feed unavailable. No paper orders will execute until fresh data returns.')
-                bot.feed = 'Unavailable'
-                bot.error = f'{type(exc).__name__}: live market request failed. Check network access to api.coinbase.com.'
+                from alpaca import AlpacaError
+                message = str(exc) if isinstance(exc, (AlpacaError, ValueError)) else 'Alpaca response could not be processed. Orders disabled; inspect your paper account.'
+                if bot.feed != 'Unavailable' or bot.error != message:
+                    bot.event('FEED', message)
+                bot.feed, bot.error = 'Unavailable', message
+                bot.regime = None
+                bot.save()
         time.sleep(10)
 
 
@@ -157,6 +316,10 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        origin = self.headers.get('Origin')
+        host = self.headers.get('Host', '')
+        if (origin and origin != 'http://' + host) or self.headers.get('Content-Type', '').split(';')[0] != 'application/json':
+            return self.send_json({'error': 'Same-origin JSON requests only'}, 403)
         if self.path != '/api/config':
             return self.send_json({'error': 'Not found'}, 404)
         try:
@@ -173,9 +336,9 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 if __name__ == '__main__':
-    bot = Bot()
+    bot = StockBot()
     bot.event('BOT', 'Dashboard connected. Paper trading only; no real orders.')
-    server = ThreadingHTTPServer(('0.0.0.0', int(os.getenv('PORT', '8000'))), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', int(os.getenv('PORT', '8000'))), Handler)
     server.bot = bot
     threading.Thread(target=poll, args=(bot,), daemon=True).start()
     print(f'Dashboard listening on port {server.server_port}', flush=True)

@@ -1,3 +1,6 @@
 __pycache__/
 data/
 .pytest_cache/
+.env
+.env.*
+*.pem
