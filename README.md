@@ -2,6 +2,10 @@
 
 A local dashboard for Alpaca paper trading in US stocks. Defaults to **SPY**. Python 3.10+; no packages to install. Market prices come from Alpaca's IEX feed, which covers IEX trades rather than the full consolidated US market.
 
+## Always-on cloud deployment
+
+Use the [Ubuntu VPS deployment guide](deploy/README.md) for Docker Compose, automatic process restarts, persistent state, and a private dashboard over SSH. Your Mac can be off while the VPS runs the strategy.
+
 ## Run on your Mac
 
 1. Create an Alpaca account, open its **Paper Trading** dashboard, and generate paper API credentials. Keep them private; never paste them into chat or commit them.
@@ -15,7 +19,7 @@ export ALPACA_SYMBOL='SPY'
 python3 server.py
 ```
 
-4. Open **http://localhost:8000**. Confirm the account and stock, then click **Resume bot**. The app starts paused on every launch. Keep the terminal running. Press Control-C to stop it. Credentials must be set again in a new terminal session. Avoid shared terminals and remove credential-containing commands from shell history.
+4. Open **http://localhost:8000**. Confirm the account and stock, then click **Resume bot**. The app starts paused on every launch by default. VPS deployments can opt into restoring the previously enabled state with `RESUME_ON_RESTART=true`. Keep the terminal running. Press Control-C to stop it. Credentials must be set again in a new terminal session. Avoid shared terminals and remove credential-containing commands from shell history.
 
 To use another stock, stop the server, change `ALPACA_SYMBOL` (for example, `AAPL`), and restart. `PORT` overrides port 8000. The server binds only to your computer's loopback interface. The local dashboard has no user authentication; do not expose it publicly.
 

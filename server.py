@@ -145,9 +145,10 @@ class StockBot(Bot):
             if saved.get('symbol') == self.symbol:
                 self.short, self.long = saved.get('short', 5), saved.get('long', 20)
                 self.events.extend(saved.get('events', []))
+                self.running = os.getenv('RESUME_ON_RESTART', '').lower() == 'true' and saved.get('running') is True
             # An unresolved submission is reconciled even if the selected ticker changes.
             self.pending = saved.get('pending')
-        self.event('BOT', f'{self.symbol} · Alpaca paper mode. Start paused; resume after reviewing your account.')
+        self.event('BOT', f'{self.symbol} · Alpaca paper mode. ' + ('Restoring enabled strategy; reconciling account and warming up.' if self.running else 'Start paused; resume after reviewing your account.'))
 
     def snapshot(self):
         with self.lock:
@@ -165,7 +166,7 @@ class StockBot(Bot):
             STOCK_DATA.parent.mkdir(exist_ok=True)
             temp = STOCK_DATA.with_suffix('.tmp')
             temp.write_text(json.dumps(dict(symbol=self.symbol, short=self.short, long=self.long,
-                                           events=list(self.events), pending=self.pending)))
+                                           events=list(self.events), pending=self.pending, running=self.running)))
             temp.replace(STOCK_DATA)
 
     def reconcile(self):
@@ -338,7 +339,7 @@ class Handler(SimpleHTTPRequestHandler):
 if __name__ == '__main__':
     bot = StockBot()
     bot.event('BOT', 'Dashboard connected. Paper trading only; no real orders.')
-    server = ThreadingHTTPServer(('127.0.0.1', int(os.getenv('PORT', '8000'))), Handler)
+    server = ThreadingHTTPServer((os.getenv('HOST', '127.0.0.1'), int(os.getenv('PORT', '8000'))), Handler)
     server.bot = bot
     threading.Thread(target=poll, args=(bot,), daemon=True).start()
     print(f'Dashboard listening on port {server.server_port}', flush=True)
