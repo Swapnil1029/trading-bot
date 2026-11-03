@@ -37,6 +37,17 @@ Before submitting an order, the bot durably records a unique client-order ID. Af
 
 ## Troubleshooting
 
+From the same terminal where you set your paper credentials, run:
+
+```sh
+python3 check_connection.py
+```
+
+This performs read-only checks of the paper account, market clock, and SPY IEX endpoint. It prints credential presence and specific failures, never key values or account balances, and submits no orders. You can share that output for diagnosis. If you downloaded a ZIP, download the latest version first so the checker and improved error messages are included.
+
+On macOS, if the error says **TLS certificate verification failed** and you installed Python from python.org, open **Applications → Python 3.x → Install Certificates.command**, run it, then restart the bot. This installs trusted certificates for that Python installation. Use your organization's approved certificate trust for a managed network; never disable certificate verification.
+
+
 - **Credentials missing / HTTP 401:** use paper keys from the same paper account and restart.
 - **Market closed:** the dashboard still reads your account; price sampling and new orders wait until regular hours. Holidays and early closes follow Alpaca's clock.
 - **HTTP 403:** check IEX data access, account permissions, or network policy. The app does not require SIP data.
